@@ -29,46 +29,80 @@ function sanitize(code: string): string {
     return code.replace(/```(typescript|ts|json)?/g, '').replace(/```/g, '').trim();
 }
 
+// 🧼 Patch the generated test code to fix request.newContext issues and import conflicts
+function patchPlaywrightAPIContextFix(testCode: string): string {
+    return testCode
+        // Remove any rogue import of APIRequestContext from anywhere
+        .replace(/import\s+\{[^}]*APIRequestContext[^}]*\}\s+from\s+['"][^'"]+['"];\s*/g, '')
+        // Remove rogue `request` import
+        .replace(/import\s+request\s+from\s+['"](http)['"];\s*/g, '')
+
+        // 🧹 Remove duplicate or partial @playwright/test imports
+        .replace(/import\s+\{[^}]*\}\s+from\s+['"]@playwright\/test['"];/g, '')
+
+        // ✅ Normalize and fix test lifecycle hooks
+        .replace(/\btest\.test\.beforeAll\b/g, 'test.beforeAll')
+        .replace(/\btest\.test\.afterAll\b/g, 'test.afterAll')
+        .replace(/test\.beforeAll\(\s*async\s*\(\s*\{\s*request\s*\}\s*\)\s*=>/g, 'test.beforeAll(async () =>')
+
+        // ✅ Fix status accessor
+        .replace(/response\.status\b(?!\(\))/g, 'response.status()')
+
+        // ✅ Inject the correct import at the top
+        .replace(/^/, `import { test, expect, request, APIRequestContext } from '@playwright/test';\n\n`);
+}
 async function generateTest(swagger: object): Promise<string> {
     const messages = [
         { role: 'system', content: systemPrompt.trim() },
         { role: 'user', content: `Generate Playwright tests for this Swagger schema:\n${JSON.stringify(swagger)}` }
     ];
 
-    const response = await axios.post('https://api.openai.com/v1/chat/completions', {
-        model: 'gpt-4',
-        messages,
-        temperature: 0.2
-    }, {
-        headers: {
-            Authorization: `Bearer ${OPENAI_API_KEY}`,
-            'Content-Type': 'application/json'
+    const response = await axios.post(
+        'https://api.openai.com/v1/chat/completions',
+        {
+            model: 'gpt-4',
+            messages,
+            temperature: 0.2
+        },
+        {
+            headers: {
+                Authorization: `Bearer ${OPENAI_API_KEY}`,
+                'Content-Type': 'application/json'
+            }
         }
-    });
+    );
 
     const raw = response.data.choices[0].message.content;
     return sanitize(raw);
 }
 
-async function processChunks() {
+async function processChunks(limit = 2) {
     if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-    const files = fs.readdirSync(CHUNKS_DIR).filter(f => f.endsWith('.json'));
+    const allFiles = fs.readdirSync(CHUNKS_DIR).filter(f => f.endsWith('.json'));
+    const files = allFiles.slice(0, limit); // 👈 Only process top `limit` Swagger chunks
 
     for (const file of files) {
         const swagger = JSON.parse(fs.readFileSync(path.join(CHUNKS_DIR, file), 'utf-8'));
         console.log(`⏳ Generating test for: ${file}`);
 
         try {
-            const testCode = await generateTest(swagger);
+            const rawTestCode = await generateTest(swagger);
+            const patchedTestCode = patchPlaywrightAPIContextFix(rawTestCode);
+
             const fileName = file.replace('-swagger.json', '.spec.ts');
             const outputPath = path.join(OUTPUT_DIR, fileName);
-            fs.writeFileSync(outputPath, testCode, 'utf-8');
+            fs.writeFileSync(outputPath, patchedTestCode, 'utf-8');
             console.log(`✅ Saved test: ${fileName}`);
         } catch (error: any) {
             console.error(`❌ Failed for ${file}: ${error.message}`);
         }
     }
+
+    if (allFiles.length > limit) {
+        console.log(`⚠️ Skipped ${allFiles.length - limit} file(s). Increase limit when ready.`);
+    }
 }
 
+// Start
 processChunks();
